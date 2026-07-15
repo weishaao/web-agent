@@ -9,6 +9,9 @@ import type {
   SubmitOfficialDeepSeekInput,
 } from '../../core/deepseek/official-api';
 import { extractToolCalls } from '../../core/interceptor/tool-parser';
+import { isDeepSeekWebMode } from '../../core/platform/manager';
+import { getActivePlatform } from '../../core/platform/ai-router';
+import type { AiStreamEvent, ChatRequest } from '../../core/platform/ai-platform';
 import {
   materializeDeepSeekImageUpload,
   type EncodedDeepSeekImageUploadRequest,
@@ -400,6 +403,119 @@ export function createChatRuntimeService(
     officialApiChatMessages = messages;
   };
 
+  // ─── Platform Router 路径 ──────────────────────────
+
+  const runPlatformToolLoop = async (
+    turn: ActiveChatTurn,
+    baseRequest: ChatRequest,
+    toolDescriptors: ToolDescriptor[],
+    excludeTabId?: number,
+  ): Promise<void> => {
+    const platform = getActivePlatform();
+    if (!platform) {
+      emitChunk(turn, { text: '', done: true, error: 'No active platform' }, excludeTabId);
+      return;
+    }
+    let currentRequest = { ...baseRequest };
+
+    for (let step = 0; step < MAX_CHAT_TOOL_STEPS; step++) {
+      assertTurnActive(turn);
+      const toolCalls: import('../../core/platform/ai-platform').ToolCall[] = [];
+      let accumulatedText = '';
+
+      for await (const event of platform.streamChat(currentRequest)) {
+        assertTurnActive(turn);
+        switch (event.type) {
+          case 'text':
+            accumulatedText += event.text;
+            emitChunk(turn, { text: event.text, done: false, phase: 'answer' }, excludeTabId);
+            break;
+          case 'reasoning':
+            emitChunk(turn, { text: '', reasoningText: event.text, done: false, phase: 'reasoning' }, excludeTabId);
+            break;
+          case 'tool_call':
+            toolCalls.push(...event.calls);
+            break;
+          case 'usage':
+            // 可选：记录 token 用量
+            break;
+          case 'error':
+            emitChunk(turn, { text: '', done: true, error: event.message }, excludeTabId);
+            return;
+          case 'finished':
+            // 正常结束，退出 loop
+            break;
+        }
+      }
+
+      // 无工具调用 → 本轮结束
+      if (toolCalls.length === 0) {
+        emitChunk(turn, { text: '', done: true }, excludeTabId);
+        return;
+      }
+
+      // 执行工具调用
+      const executions: ToolExecutionRecord[] = [];
+      for (const call of toolCalls) {
+        assertTurnActive(turn);
+        const result = await executeChatTool(turn, {
+          id: call.id,
+          name: call.name,
+          payload: {},
+          raw: call.arguments,
+          invocationName: call.name,
+        } as import('../../core/tool/types').ToolCall);
+        executions.push(result);
+      }
+      assertTurnActive(turn);
+
+      // 工具结果 → 下一轮 prompt
+      currentRequest = {
+        ...currentRequest,
+        prompt: dependencies.continueWithToolResults(serializeToolExecutions(executions)),
+      };
+    }
+
+    emitChunk(turn, { text: dependencies.maxToolStepsMessage(), done: true }, excludeTabId);
+  };
+
+  const runPlatformPrompt = async (
+    turn: ActiveChatTurn,
+    request: ChatSubmitRequest,
+    excludeTabId?: number,
+  ): Promise<void> => {
+    const platform = getActivePlatform();
+    if (!platform) {
+      emitChunk(turn, { text: '', done: true, error: 'No active platform' }, excludeTabId);
+      return;
+    }
+
+    // 构建增强 prompt（注入记忆/技能/工具）
+    const promptContext = await buildPrompt(request.text);
+    assertTurnActive(turn);
+
+    // 创建适配器会话
+    let sessionId: string;
+    try {
+      sessionId = await platform.createSession();
+    } catch {
+      sessionId = `platform-${Date.now()}`;
+    }
+    assertTurnActive(turn);
+
+    const chatRequest: ChatRequest = {
+      sessionId,
+      parentMessageId: null,
+      modelType: null,
+      prompt: promptContext.augmented,
+      refFileIds: request.refFileIds,
+      thinkingEnabled: false,
+      searchEnabled: false,
+    };
+
+    await runPlatformToolLoop(turn, chatRequest, promptContext.enabledDescriptors, excludeTabId);
+  };
+
   const runChatTurn = async (
     turn: ActiveChatTurn,
     request: ChatSubmitRequest,
@@ -409,12 +525,11 @@ export function createChatRuntimeService(
     try {
       const apiKey = await dependencies.getDeepSeekApiKey();
       assertTurnActive(turn);
-      const provider: ChatLoopProvider = apiKey ? 'official-api' : 'web';
-      await dependencies.markChatLoopStarted(provider);
-      markerStarted = true;
-      assertTurnActive(turn);
 
-      if (apiKey) {
+      // Platform Router 路由：非 deepseek-web 模式走适配器
+      if (!isDeepSeekWebMode()) {
+        await runPlatformPrompt(turn, request, excludeTabId);
+      } else if (apiKey) {
         await runOfficialPrompt(turn, request, apiKey, excludeTabId);
       } else {
         await runWebPrompt(turn, request, excludeTabId);
