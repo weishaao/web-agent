@@ -245,6 +245,7 @@ import { createDeepSeekRuntimeHandlers } from './background/deepseek-runtime-han
 import { createBackgroundRuntimeHandlers } from './background/background-runtime-handlers';
 import { refreshDeepSeekAuthFromTabs } from './background/deepseek-auth-refresh';
 import { createSyncRuntimeService } from './background/sync-runtime-service';
+import { initializePlatform } from '../core/platform/manager';
 import {
   createTranslator,
   DEFAULT_LOCALE,
@@ -660,6 +661,9 @@ export default defineBackground(() => {
     .then(() => scanDueAutomationsFromWake()
       .catch((error) => reportBackgroundStartupError('automation_startup_scan_failed', error)))
     .catch(acknowledgeReportedSyncRecoveryFailure);
+
+  // 初始化 AI 平台
+  initializePlatform().catch((error) => console.warn('[Background] Platform init failed:', error));
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     let envelope: RuntimeMessageEnvelope | undefined;

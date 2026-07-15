@@ -1,12 +1,18 @@
 import { useI18n } from '../../i18n';
 import { SettingsSection, StatusBadge, StatusMessage, TextField, ToggleRow } from './primitives';
 import type { SettingsState } from '../../controllers/useSettingsController';
+import { PlatformSelector } from './PlatformSelector';
 
 export default function ApiSubPage({ state }: { state: SettingsState }) {
   const { t } = useI18n();
 
   return (
     <div className="space-y-5">
+      {/* AI 平台选择器 */}
+      <SettingsSection title="AI 平台" description="选择模型后端">
+        <PlatformSelector />
+      </SettingsSection>
+
       <SettingsSection
         title="DeepSeek API Key"
         description={t('sidepanel.settings.apiKeyDescription')}
